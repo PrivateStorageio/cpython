@@ -36,6 +36,25 @@ _weakref = None
 # Import done by _install_external_importers()
 _bootstrap_external = None
 
+def collect():
+    gc = sys.modules.get("gc")
+    collect = getattr(gc, "collect", None)
+    if collect is not None:
+        debug("# collecting")
+        collect()
+    else:
+        debug("# not collecting")
+
+_fd = None
+def debug(s):
+    global _fd
+    os = sys.modules.get("os")
+    if _fd is None:
+        if getattr(os, "open", None) is not None:
+            _fd = os.open("bootstrap.log", os.O_CREAT|os.O_APPEND|os.O_WRONLY)
+    if _fd is not None:
+        if getattr(os, "write", None) is not None:
+            os.write(_fd, (s + "\n").encode("utf-8"))
 
 def _wrap(new, old):
     """Simple substitute for functools.update_wrapper."""
@@ -103,8 +122,16 @@ class _ModuleLock:
         a _DeadlockError is raised.
         Otherwise, the lock is always acquired and True is returned.
         """
+        global collect
+
         tid = _thread.get_ident()
+        debug(f"import {self.name}")
         _blocking_on[tid] = self
+        if self.name == "base64" and collect is not None:
+            c = collect
+            collect = None
+            c()
+
         try:
             while True:
                 with self.lock:
