@@ -80,9 +80,15 @@ def _new_module(name):
 # A dict mapping module names to weakrefs of _ModuleLock instances
 # Dictionary protected by the global import lock
 _module_locks = {}
-# A dict mapping thread ids to _ModuleLock instances
-_blocking_on = {}
 
+# A dict mapping thread ids to lists of _ModuleLock instances.  This maps a
+# thread to the module locks it is blocking on acquiring.  The values are a
+# list because a single thread could perform a re-entrant import and be "in
+# the process" of blocking on locks for more than one module.  "in the
+# process" because a thread cannot actually block on acquiring more than one
+# lock but it can have set up bookkeeping that reflects that it intends to
+# block on acquiring more than one lock.
+_blocking_on = {}
 
 class _DeadlockError(RuntimeError):
     pass
@@ -153,8 +159,23 @@ class _ModuleLock:
         Otherwise, the lock is always acquired and True is returned.
         """
         tid = _thread.get_ident()
-        debug(f"import {self.name}")
-        _blocking_on[tid] = self
+
+        # Protect interaction with the global `_blocking_on` with the global
+        # import lock.
+        with _ImportLockContext():
+            if tid in _blocking_on:
+                # In this case we are re-entering this acquire method.  It is
+                # not only that we are doing a re-entrant import but we are
+                # re-entrantly acquiring an import lock.  This is possible if
+                # an import is triggered by the garbage collector, a signal
+                # handler, etc.
+                debug(f"re-entering import for {self.name}, "
+                      f"already importing {_blocking_on[tid]}")
+                _blocking_on[tid].append(self)
+            else:
+                # This is the common case where this thread is not already
+                # mid-acquire.
+                _blocking_on[tid] = [self]
 
         collect(self.name)
         try:
@@ -213,7 +234,10 @@ class _ModuleLock:
                 # next iteration around this while loop.
                 self.wakeup.release()
         finally:
-            del _blocking_on[tid]
+            # Protect interaction with global state with the global import
+            # lock.
+            with _ImportLockContext():
+                _blocking_on[tid].remove(self)
 
     def release(self):
         tid = _thread.get_ident()
