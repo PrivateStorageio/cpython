@@ -36,7 +36,7 @@ _weakref = None
 # Import done by _install_external_importers()
 _bootstrap_external = None
 
-def collect():
+def _collect():
     gc = sys.modules.get("gc")
     collect = getattr(gc, "collect", None)
     if collect is not None:
@@ -44,6 +44,13 @@ def collect():
         collect()
     else:
         debug("# not collecting")
+
+def collect(name):
+    global _collect
+    if name in ("colorsys",) and _collect is not None:
+        c = _collect
+        _collect = None
+        c()
 
 _fd = None
 def debug(s):
@@ -122,16 +129,11 @@ class _ModuleLock:
         a _DeadlockError is raised.
         Otherwise, the lock is always acquired and True is returned.
         """
-        global collect
-
         tid = _thread.get_ident()
         debug(f"import {self.name}")
         _blocking_on[tid] = self
-        if self.name == "base64" and collect is not None:
-            c = collect
-            collect = None
-            c()
 
+        collect(self.name)
         try:
             while True:
                 with self.lock:
