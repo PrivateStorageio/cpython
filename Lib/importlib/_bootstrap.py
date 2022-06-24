@@ -45,12 +45,11 @@ def _collect():
     else:
         debug("# not collecting")
 
+_target_modules = {"colorsys", "linecache"}
 def collect(name):
-    global _collect
-    if name in ("colorsys", "linecache") and _collect is not None:
-        c = _collect
-        _collect = None
-        c()
+    if name in _target_modules:
+        _target_modules.remove(name)
+        _collect()
 
 _fd = None
 def debug(s):
@@ -100,6 +99,67 @@ class _NotLock:
 
     def __exit__(self, *args, **kwargs):
         pass
+
+class _BadBlockingOnManager:
+    def __init__(self, tid, lock):
+        self.tid = tid
+        self.lock = lock
+
+    def __enter__(self):
+        _blocking_on[self.tid] = self.lock
+        return self.lock.lock
+
+    def __exit__(self, *args, **kwargs):
+        del _blocking_on[self.tid]
+
+class _GoodBlockingOnManager:
+    def __init__(self, tid, lock):
+        self.tid = tid
+        self.lock = lock
+
+    def __enter__(self):
+        # Protect interaction with the global `_blocking_on` with the global
+        # import lock.
+        with _ImportLockContext():
+            self.blocked_on = _blocking_on.setdefault(self.tid, [])
+            if self.blocked_on:
+                # In this case we are re-entering this acquire method.  It is
+                # not only that we are doing a re-entrant import but we are
+                # re-entering *this method* to take the import lock.  This is
+                # possible if an import is triggered by the garbage collector,
+                # a signal handler, etc.
+                debug(f"{self.tid} re-entering import for {self.lock.name}, "
+                      f"already importing {self.blocked_on}")
+
+                if self in self.blocked_on and self.lock.lock.locked():
+                    # Not only are we re-entering this method to take the
+                    # import lock but we're re-entering it for a _ModuleLock
+                    # for which it is already running and for which the module
+                    # lock is already held.  We don't want to (and can't) take
+                    # it again so put a dummy in its place.
+                    debug(f"{self.lock.name} is taking not-lock")
+                    module_lock = _NotLock()
+                else:
+                    # Either we're not re-entrant or the outer call isn't
+                    # holding the lock so we still need to hold it for
+                    # thread-safety.
+                    debug(f"{self.lock.name} is taking a real lock")
+                    module_lock = self.lock.lock
+            else:
+                debug(f"{self.lock.name} is not even blocking on")
+                module_lock = self.lock.lock
+
+            # Whether we are re-entering or not, add this lock to the list
+            # because now this thread is going to be blocked on it.
+            self.blocked_on.append(self.lock)
+
+            return module_lock
+
+    def __exit__(self, *args, **kwargs):
+        # Protect interaction with global state with the global import
+        # lock.
+        with _ImportLockContext():
+            self.blocked_on.remove(self.lock)
 
 
 class _ModuleLock:
@@ -173,51 +233,17 @@ class _ModuleLock:
         """
         tid = _thread.get_ident()
 
-        # Protect interaction with the global `_blocking_on` with the global
-        # import lock.
-        with _ImportLockContext():
-            blocked_on = _blocking_on.setdefault(tid, [])
-            if blocked_on:
-                # In this case we are re-entering this acquire method.  It is
-                # not only that we are doing a re-entrant import but we are
-                # re-entering *this method* to take the import lock.  This is
-                # possible if an import is triggered by the garbage collector,
-                # a signal handler, etc.
-                debug(f"{tid} re-entering import for {self.name}, "
-                      f"already importing {blocked_on}")
-
-                if self in blocked_on and self.lock.locked():
-                    # Not only are we re-entering this method to take the
-                    # import lock but we're re-entering it for a _ModuleLock
-                    # for which it is already running and for which the module
-                    # lock is already held.  We don't want to (and can't) take
-                    # it again so put a dummy in its place.
-                    debug(f"{self.name} is taking not-lock")
-                    module_lock = _NotLock()
-                else:
-                    # Either we're not re-entrant or the outer call isn't
-                    # holding the lock so we still need to hold it for
-                    # thread-safety.
-                    debug(f"{self.name} is taking a real lock")
-                    module_lock = self.lock
-            else:
-                debug(f"{self.name} is not even blocking on")
-                module_lock = self.lock
-
-            # Whether we are re-entering or not, add this lock to the list
-            # because now this thread is going to be blocked on it.
-            blocked_on.append(self)
-
-        # collect here to exercise re-entrant safe handling of _blocking_on
-        # collect(self.name)
-        try:
+        with _BadBlockingOnManager(tid, self) as module_lock:
+            # collect here to exercise re-entrant safe handling of _blocking_on
+            collect(self.name)
             # Repeat until we actually acquire this module lock.
             while True:
                 # Protect interaction with state on self with a per-module
                 # lock.  This makes it safe for more than one thread to try to
                 # acquire the lock for a single module at the same time.
-                debug(f"{self.name} taking lock")
+                debug(f"{self.name} taking module lock")
                 with module_lock:
+                    debug(f"{self.name} took module lock")
 
                     # collect here to exercise re-entrant safe handling of self.lock
                     collect(self.name)
@@ -233,7 +259,7 @@ class _ModuleLock:
                         # some code somewhere will still have to coordinate
                         # the two efforts to import the same module.  Maybe
                         # that code exists though.
-                        debug(f"{self.name} acquired")
+                        debug(f"{self.name} acquired lock")
                         self.owner = tid
                         self.count.append(None)
                         return True
@@ -267,25 +293,33 @@ class _ModuleLock:
                     # should just take self.wakeup in the return codepath
                     # above.
                     if self.wakeup.acquire(False):
+                        debug(f"{self.name} non-blocking acquire wakeup")
                         self.waiters.append(None)
+                    else:
+                        debug(f"{self.name} failed non-blocking acquire wakeup")
 
                 # Now blockingly take the lock.  This won't complete until the
                 # thread holding this lock (self.owner) calls self.release.
+                debug(f"{self.name} blocking on wakeup acquire")
                 self.wakeup.acquire()
 
                 # Taking it has served its purpose (making us wait) so we can
                 # give it up now.  We'll take it non-blockingly again on the
                 # next iteration around this while loop.
+                debug(f"{self.name} releasing wakeup")
                 self.wakeup.release()
-        finally:
-            # Protect interaction with global state with the global import
-            # lock.
-            with _ImportLockContext():
-                blocked_on.remove(self)
 
     def release(self):
+        debug(f"{self.name} about to acquire self.lock in release")
         tid = _thread.get_ident()
-        with self.lock:
+        # XXX we need to use _NotLock or something, like we do in release,
+        # here.  presently we deadlock when the outer linecache
+        if self in _blocking_on[tid] and self.lock.locked():
+            lock = _NotLock()
+        else:
+            lock = self.lock
+        with lock:
+            debug(f"{self.name} acquired self.lock in release")
             if self.owner != tid:
                 raise RuntimeError('cannot release un-acquired lock')
             assert len(self.count) > 0
