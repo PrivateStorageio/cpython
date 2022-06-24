@@ -47,7 +47,7 @@ def _collect():
 
 def collect(name):
     global _collect
-    if name in ("colorsys",) and _collect is not None:
+    if name in ("colorsys", "linecache") and _collect is not None:
         c = _collect
         _collect = None
         c()
