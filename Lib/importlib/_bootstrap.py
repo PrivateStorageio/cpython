@@ -166,9 +166,9 @@ class _ModuleLock:
             if tid in _blocking_on:
                 # In this case we are re-entering this acquire method.  It is
                 # not only that we are doing a re-entrant import but we are
-                # re-entrantly acquiring an import lock.  This is possible if
-                # an import is triggered by the garbage collector, a signal
-                # handler, etc.
+                # re-entering *this method* to take the import lock.  This is
+                # possible if an import is triggered by the garbage collector,
+                # a signal handler, etc.
                 debug(f"re-entering import for {self.name}, "
                       f"already importing {_blocking_on[tid]}")
                 _blocking_on[tid].append(self)
@@ -202,12 +202,18 @@ class _ModuleLock:
 
                     # At this point we know the lock is held (because count !=
                     # 0) by another thread (because owner != tid).  We'll have
-                    # to get in line.
+                    # to get in line to take the module lock.
 
                     # But first, check to see if this thread would create a
                     # deadlock by acquiring this module lock.  If it would
                     # then just stop with an error.  XXX It's not clear who is
-                    # expected to handle this error.
+                    # expected to handle this error.  This is one handler in
+                    # _lock_unlock_module but many times this method is called
+                    # by _ModuleLockManager.__enter__ instead - and so
+                    # _DeadlockError will just propagate up to application
+                    # code.  This seems to be more than just a hypothetical -
+                    # https://stackoverflow.com/questions/59509154
+                    # https://github.com/encode/django-rest-framework/issues/7078
                     if self.has_deadlock():
                         raise _DeadlockError('deadlock detected by %r' % self)
 
