@@ -94,6 +94,14 @@ class _DeadlockError(RuntimeError):
     pass
 
 
+class _NotLock:
+    def __enter__(self):
+        pass
+
+    def __exit__(self, *args, **kwargs):
+        pass
+
+
 class _ModuleLock:
     """A recursive lock implementation which is able to detect deadlocks
     (e.g. thread 1 trying to take locks A then B, and thread 2 trying to
@@ -116,7 +124,11 @@ class _ModuleLock:
         # behavior, necessary in case a single thread is following a circular
         # import dependency and needs to take the lock for a single module
         # more than once.
-        self.count = 0
+        #
+        # Counts are represented as a list of None because list.append(None)
+        # and list.pop() are both atomic and thread-safe and it's hard to find
+        # another primitive with the same properties.
+        self.count = []
 
         # This is a count of the number of threads that are blocking on
         # `self.wakeup.acquire()` to try to get their turn holding this module
@@ -128,8 +140,9 @@ class _ModuleLock:
         #
         # This is incremented in `self.acquire` when a thread notices it is
         # going to have to wait for another thread to finish.
-
-        self.waiters = 0
+        #
+        # See the comment above count for explanation of the representation.
+        self.waiters = []
 
     def has_deadlock(self):
         # Deadlock avoidance for concurrent circular imports.
@@ -163,29 +176,53 @@ class _ModuleLock:
         # Protect interaction with the global `_blocking_on` with the global
         # import lock.
         with _ImportLockContext():
-            if tid in _blocking_on:
+            blocked_on = _blocking_on.setdefault(tid, [])
+            if blocked_on:
                 # In this case we are re-entering this acquire method.  It is
                 # not only that we are doing a re-entrant import but we are
                 # re-entering *this method* to take the import lock.  This is
                 # possible if an import is triggered by the garbage collector,
                 # a signal handler, etc.
-                debug(f"re-entering import for {self.name}, "
-                      f"already importing {_blocking_on[tid]}")
-                _blocking_on[tid].append(self)
-            else:
-                # This is the common case where this thread is not already
-                # mid-acquire.
-                _blocking_on[tid] = [self]
+                debug(f"{tid} re-entering import for {self.name}, "
+                      f"already importing {blocked_on}")
 
-        collect(self.name)
+                if self in blocked_on and self.lock.locked():
+                    # Not only are we re-entering this method to take the
+                    # import lock but we're re-entering it for a _ModuleLock
+                    # for which it is already running and for which the module
+                    # lock is already held.  We don't want to (and can't) take
+                    # it again so put a dummy in its place.
+                    debug(f"{self.name} is taking not-lock")
+                    module_lock = _NotLock()
+                else:
+                    # Either we're not re-entrant or the outer call isn't
+                    # holding the lock so we still need to hold it for
+                    # thread-safety.
+                    debug(f"{self.name} is taking a real lock")
+                    module_lock = self.lock
+            else:
+                debug(f"{self.name} is not even blocking on")
+                module_lock = self.lock
+
+            # Whether we are re-entering or not, add this lock to the list
+            # because now this thread is going to be blocked on it.
+            blocked_on.append(self)
+
+        # collect here to exercise re-entrant safe handling of _blocking_on
+        # collect(self.name)
         try:
             # Repeat until we actually acquire this module lock.
             while True:
                 # Protect interaction with state on self with a per-module
                 # lock.  This makes it safe for more than one thread to try to
                 # acquire the lock for a single module at the same time.
-                with self.lock:
-                    if self.count == 0 or self.owner == tid:
+                debug(f"{self.name} taking lock")
+                with module_lock:
+
+                    # collect here to exercise re-entrant safe handling of self.lock
+                    collect(self.name)
+
+                    if self.count == [] or self.owner == tid:
                         # If the lock for this module is unowned then we can
                         # take the lock immediately and succeed.  If the lock
                         # for this module is owned by the running thread then
@@ -196,8 +233,9 @@ class _ModuleLock:
                         # some code somewhere will still have to coordinate
                         # the two efforts to import the same module.  Maybe
                         # that code exists though.
+                        debug(f"{self.name} acquired")
                         self.owner = tid
-                        self.count += 1
+                        self.count.append(None)
                         return True
 
                     # At this point we know the lock is held (because count !=
@@ -229,7 +267,7 @@ class _ModuleLock:
                     # should just take self.wakeup in the return codepath
                     # above.
                     if self.wakeup.acquire(False):
-                        self.waiters += 1
+                        self.waiters.append(None)
 
                 # Now blockingly take the lock.  This won't complete until the
                 # thread holding this lock (self.owner) calls self.release.
@@ -243,19 +281,19 @@ class _ModuleLock:
             # Protect interaction with global state with the global import
             # lock.
             with _ImportLockContext():
-                _blocking_on[tid].remove(self)
+                blocked_on.remove(self)
 
     def release(self):
         tid = _thread.get_ident()
         with self.lock:
             if self.owner != tid:
                 raise RuntimeError('cannot release un-acquired lock')
-            assert self.count > 0
-            self.count -= 1
-            if self.count == 0:
+            assert len(self.count) > 0
+            self.count.pop()
+            if len(self.count) == 0:
                 self.owner = None
-                if self.waiters:
-                    self.waiters -= 1
+                if len(self.waiters) > 0:
+                    self.waiters.pop()
                     self.wakeup.release()
 
     def __repr__(self):
@@ -1295,15 +1333,18 @@ def _find_and_load(name, import_):
     module = sys.modules.get(name, _NEEDS_LOADING)
     if (module is _NEEDS_LOADING or
         getattr(getattr(module, "__spec__", None), "_initializing", False)):
+        debug(f"_find_and_load {name} 1")
         with _ModuleLockManager(name):
             module = sys.modules.get(name, _NEEDS_LOADING)
             if module is _NEEDS_LOADING:
+                debug(f"_find_and_load {name} 2")
                 return _find_and_load_unlocked(name, import_)
 
         # Optimization: only call _bootstrap._lock_unlock_module() if
         # module.__spec__._initializing is True.
         # NOTE: because of this, initializing must be set *before*
         # putting the new module in sys.modules.
+        debug(f"_find_and_load {name} 3")
         _lock_unlock_module(name)
 
     if module is None:
